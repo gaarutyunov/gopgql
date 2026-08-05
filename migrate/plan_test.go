@@ -452,6 +452,72 @@ func TestErrHalfDisownedIsASentinel(t *testing.T) {
 	require.True(t, errors.Is(err, migrate.ErrHalfDisowned))
 }
 
+// TestTheRefusalCarriesItsHalf is what lets the CLI pick its guidance from the
+// error instead of re-reading the flags: the half is on the error, and the
+// umbrella sentinel still matches so no existing caller has to change.
+func TestTheRefusalCarriesItsHalf(t *testing.T) {
+	base := mustSchema(t, baseSDL)
+
+	for _, tc := range []struct {
+		name string
+		then migrate.Halves
+		want migrate.Half
+	}{
+		{name: "--no-graph", then: migrate.Halves{NoGraph: true}, want: migrate.GraphHalf},
+		{name: "--no-tables", then: migrate.Halves{NoTables: true}, want: migrate.TablesHalf},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, err := migrate.Generate(dir, base, "init", migrate.Halves{})
+			require.NoError(t, err)
+
+			_, err = migrate.Generate(dir, base, "again", tc.then)
+			var conflict *migrate.HalfConflictError
+			require.ErrorAs(t, err, &conflict)
+			assert.Equal(t, tc.want, conflict.Half)
+			assert.ErrorIs(t, err, migrate.ErrHalfDisowned,
+				"the umbrella sentinel still matches")
+		})
+	}
+}
+
+// TestTheTablesHalfCannotBeTurnedOnLater is the other side of the asymmetry
+// TestAHalfCanBeTurnedOnLater covers, and the direction that is unsafe.
+//
+// A graph-only history folds its vertex tables with no columns — the partial
+// fold design D6 asks for — so a generation with the tables half on diffs the
+// desired columns against nothing and emits ADD COLUMN for every one of them,
+// against tables whose owner already created them. Applying that fails, and it
+// fails after the graph teardown in front of it has committed: the graph is
+// gone, the directory cannot go forwards, and replaying from zero hits the same
+// ALTER. The refusal has to happen at generate time or not at all.
+func TestTheTablesHalfCannotBeTurnedOnLater(t *testing.T) {
+	base := mustSchema(t, baseSDL)
+	dir := t.TempDir()
+
+	written, err := migrate.Generate(dir, base, "init", migrate.Halves{NoTables: true})
+	require.NoError(t, err, "graph only, over tables someone else owns")
+	require.NotEmpty(t, written)
+
+	_, err = migrate.Generate(dir, mustSchema(t, widenedSDL), "oops", migrate.Halves{})
+
+	require.Error(t, err, "the tables half has no prior columns to diff against")
+	var conflict *migrate.HalfConflictError
+	require.ErrorAs(t, err, &conflict)
+	assert.Equal(t, migrate.TablesHalf, conflict.Half)
+	assert.True(t, conflict.Adopting, "the half is being turned on, not off")
+	assert.ErrorIs(t, err, migrate.ErrHalfDisowned)
+
+	entries, dirErr := os.ReadDir(dir)
+	require.NoError(t, dirErr)
+	assert.Len(t, entries, len(written), "nothing may be written when the check fires")
+
+	// And the directory keeps working with the half it does own.
+	paths, err := migrate.Generate(dir, mustSchema(t, widenedSDL), "widen", migrate.Halves{NoTables: true})
+	require.NoError(t, err)
+	assert.NotEmpty(t, paths)
+}
+
 // baseNames reduces written paths to their filenames.
 func baseNames(paths []string) []string {
 	out := make([]string, len(paths))

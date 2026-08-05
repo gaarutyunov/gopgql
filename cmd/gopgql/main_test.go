@@ -31,11 +31,16 @@ type Person @node(label: "person") {
 // test must not depend on the network resolving or timing out.
 const unreachableDSN = "postgres://gopgql@127.0.0.1:1/gopgql?sslmode=disable&connect_timeout=1"
 
-// writeSDL puts a schema in a temp file and returns its path.
-func writeSDL(t *testing.T, source string) string {
+// writeSDL puts [minimalSDL] in a temp file and returns its path.
+//
+// It takes no schema because every test here wants the same one: what is under
+// test in this package is the CLI's flag, environment and exit-status handling,
+// and the SDL is only the input those need in order to have something to run
+// against. Schema-dependent behaviour is tested where the schema is read.
+func writeSDL(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "schema.graphql")
-	require.NoError(t, os.WriteFile(path, []byte(source), 0o600))
+	require.NoError(t, os.WriteFile(path, []byte(minimalSDL), 0o600))
 	return path
 }
 
@@ -133,7 +138,7 @@ func TestConformRequiresBothSides(t *testing.T) {
 	assert.Contains(t, err.Error(), "--sdl")
 	assert.Equal(t, exitFailure, exitCode(err))
 
-	err = run([]string{"conform", "--sdl", writeSDL(t, minimalSDL)})
+	err = run([]string{"conform", "--sdl", writeSDL(t)})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--dsn")
 	assert.Equal(t, exitFailure, exitCode(err))
@@ -143,7 +148,7 @@ func TestConformRequiresBothSides(t *testing.T) {
 // conform resolves --sdl and --dsn exactly as generate and migrate do, so an
 // init container that already exports them needs no extra flags.
 func TestConformReadsSDLFromTheEnvironment(t *testing.T) {
-	t.Setenv("GOPGQL_SDL", writeSDL(t, minimalSDL))
+	t.Setenv("GOPGQL_SDL", writeSDL(t))
 	t.Setenv("GOPGQL_DSN", "")
 
 	err := run([]string{"conform"})
@@ -160,7 +165,7 @@ func TestConformUnreachableDatabaseIsNotDrift(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	err := conformCheck(ctx, writeSDL(t, minimalSDL), unreachableDSN, "")
+	err := conformCheck(ctx, writeSDL(t), unreachableDSN, "")
 	require.Error(t, err)
 
 	var drift *driftError
@@ -255,8 +260,109 @@ func TestVersionReportsBuildInfo(t *testing.T) {
 	}
 }
 
+// TestNoHalfEnvVarsParseTheirValue asserts the two GOPGQL_NO_* variables mean
+// what they say. They are documented in the usage text, so they are public
+// surface, and `false` is exactly what a compose file or a Helm values block
+// writes for "off" — testing them for emptiness made GOPGQL_NO_TABLES=false turn
+// the tables half off, silently and in the direction that loses table DDL.
+//
+// The assertion is on the files a generation writes rather than on a parsed
+// flag, because that is the behaviour the variable is being set to control.
+func TestNoHalfEnvVarsParseTheirValue(t *testing.T) {
+	const bothHalves = "0001_env_tables.sql,0002_env_graph.sql"
+
+	for _, tc := range []struct {
+		name     string
+		noTables string
+		noGraph  string
+		want     string
+	}{
+		{name: "unset", want: bothHalves},
+		{name: "empty", noTables: "", noGraph: "", want: bothHalves},
+		{name: "GOPGQL_NO_TABLES=false", noTables: "false", want: bothHalves},
+		{name: "GOPGQL_NO_TABLES=0", noTables: "0", want: bothHalves},
+		{name: "GOPGQL_NO_TABLES=true", noTables: "true", want: "0001_env_graph.sql"},
+		{name: "GOPGQL_NO_TABLES=1", noTables: "1", want: "0001_env_graph.sql"},
+		{name: "GOPGQL_NO_GRAPH=false", noGraph: "false", want: bothHalves},
+		{name: "GOPGQL_NO_GRAPH=0", noGraph: "0", want: bothHalves},
+		{name: "GOPGQL_NO_GRAPH=true", noGraph: "true", want: "0001_env_tables.sql"},
+		{name: "GOPGQL_NO_GRAPH=1", noGraph: "1", want: "0001_env_tables.sql"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Both are set every time, so an ambient value cannot decide a case.
+			t.Setenv("GOPGQL_NO_TABLES", tc.noTables)
+			t.Setenv("GOPGQL_NO_GRAPH", tc.noGraph)
+			dir := filepath.Join(t.TempDir(), "migrations")
+
+			require.NoError(t, run([]string{"generate",
+				"--sdl", writeSDL(t), "--dir", dir, "--name", "env"}))
+
+			assert.Equal(t, tc.want, strings.Join(written(t, dir), ","))
+		})
+	}
+}
+
 // TestUsageDocumentsVersion: the subcommand is only useful if it is
 // discoverable without already knowing it exists.
 func TestUsageDocumentsVersion(t *testing.T) {
 	assert.Contains(t, usage, "version    Print the version, commit and build date")
+}
+
+// TestNoHalfEnvVarsRejectAValueTheyCannotRead: neither default is safe to guess
+// at — false ignores an operator who meant to disable a half, true disables one
+// they never asked to — so an unparseable value stops the run and names itself.
+func TestNoHalfEnvVarsRejectAValueTheyCannotRead(t *testing.T) {
+	for _, name := range []string{"GOPGQL_NO_TABLES", "GOPGQL_NO_GRAPH"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("GOPGQL_NO_TABLES", "")
+			t.Setenv("GOPGQL_NO_GRAPH", "")
+			t.Setenv(name, "yes")
+			dir := filepath.Join(t.TempDir(), "migrations")
+
+			err := run([]string{"generate",
+				"--sdl", writeSDL(t), "--dir", dir, "--name", "env"})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), name)
+			assert.Contains(t, err.Error(), "is not a boolean")
+			assert.NoDirExists(t, dir, "nothing is generated on a value that could not be read")
+		})
+	}
+}
+
+// TestUsageSeparatesAnInterruptedApplyFromAFailedOne pins the correction to the
+// advice that mattered. "Re-run it and it continues from where it stopped" is
+// true for a crash or a ^C and false for the case an operator is far more likely
+// to hit: a _tables migration that PostgreSQL itself refused. Re-running fails
+// identically, the graph teardown in front of it has already committed, and the
+// only way out is a step back. The usage text has to distinguish the two and
+// name gopgql conform, which is what detects the state.
+func TestUsageSeparatesAnInterruptedApplyFromAFailedOne(t *testing.T) {
+	assert.Contains(t, usage, "gopgql conform reports as \"property\n           graph not found\"",
+		"the state has a detector, and the help is where it gets named")
+	assert.Contains(t, usage, "continues from where it\n                                        stopped",
+		"still the right advice for an interrupted run")
+	assert.Contains(t, usage, "re-running fails identically",
+		"and explicitly not the right advice for a failed _tables migration")
+	assert.Contains(t, usage, "goose down one step",
+		"the only way out, so it must be in the text")
+}
+
+// TestUsageDocumentsTheBooleanEnvVars keeps the accepted values discoverable
+// from the usage text, which is where the variables are announced at all.
+func TestUsageDocumentsTheBooleanEnvVars(t *testing.T) {
+	assert.Contains(t, usage, "GOPGQL_NO_TABLES and GOPGQL_NO_GRAPH")
+	assert.Contains(t, usage, "take a boolean")
+}
+
+// written lists the filenames in dir, in the order goose applies them.
+func written(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }

@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"text/tabwriter"
 
 	// Registers the "pgx" database/sql driver goose runs through.
@@ -76,8 +77,16 @@ Flags:
            The graph comes down first because PostgreSQL refuses to alter a
            column a live property graph exposes, and goes back up last over the
            tables of its own generation. gopgql migrate is that plain forward
-           apply; a generation is not atomic, so an interrupted run may leave
-           the graph down — re-run it and it continues from where it stopped.
+           apply; a generation is not atomic, so an apply that stops partway
+           leaves the graph down, which gopgql conform reports as "property
+           graph not found". How to recover depends on why it stopped:
+             interrupted (a crash, ^C)  re-run it; it continues from where it
+                                        stopped and the graph comes back up.
+             the _tables migration      re-running fails identically — the DDL
+             failed (NOT NULL over      is the problem. The teardown in front
+             existing rows, a type      of it has committed, so replaying from
+             change PG refuses)         zero is no better. goose down one step
+                                        restores the graph; then fix the SDL.
   --no-tables  Skip the tables half — someone else owns the tables, and the
                SDL describes only the slice surfaced as a graph. Nothing about
                a table is read, diffed or emitted. (env GOPGQL_NO_TABLES)
@@ -88,7 +97,9 @@ Flags:
            applying is always the whole directory.
   --name   Descriptive suffix for a generated delta. Default "schema".
   --graph  Property-graph name. Default is the generator's.
-A flag wins over its environment variable.
+A flag wins over its environment variable. GOPGQL_NO_TABLES and GOPGQL_NO_GRAPH
+take a boolean — true/false, 1/0, t/f — and an unset or empty one is false;
+anything else is an error rather than a guessed default.
 
 Exit status:
   0  Success — for conform, the database matches the SDL.
@@ -202,12 +213,18 @@ func run(argv []string) error {
 	if *dir == "" {
 		*dir = "migrations"
 	}
-	if !*noTables && os.Getenv("GOPGQL_NO_TABLES") != "" {
-		*noTables = true
+	// The boolean pair is read the same way, except that their values have to be
+	// parsed rather than merely tested for emptiness — see [envBool].
+	noTablesEnv, err := envBool("GOPGQL_NO_TABLES")
+	if err != nil {
+		return err
 	}
-	if !*noGraph && os.Getenv("GOPGQL_NO_GRAPH") != "" {
-		*noGraph = true
+	noGraphEnv, err := envBool("GOPGQL_NO_GRAPH")
+	if err != nil {
+		return err
 	}
+	*noTables = *noTables || noTablesEnv
+	*noGraph = *noGraph || noGraphEnv
 	if *noTables && *noGraph {
 		return errors.New("--no-tables and --no-graph together leave nothing to do")
 	}
@@ -256,6 +273,30 @@ func run(argv []string) error {
 	}
 }
 
+// envBool reads a boolean environment variable. Unset or empty is false.
+//
+// It parses the value rather than testing it for emptiness, because these two
+// variables are documented surface and `false` is exactly what a compose file or
+// a Helm values block writes for "off". Treating any non-empty string as true
+// made GOPGQL_NO_TABLES=false turn the tables half *off* — the opposite of what
+// it says.
+//
+// Anything strconv.ParseBool does not recognise is an error rather than a silent
+// default, because both defaults are wrong to guess at: choosing false ignores
+// an operator who meant to disable a half, and choosing true disables one they
+// never asked to.
+func envBool(name string) (bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return false, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s=%q is not a boolean: use true/false, 1/0, t/f, TRUE/FALSE", name, raw)
+	}
+	return v, nil
+}
+
 // generate writes the generation the SDL calls for into dir.
 func generate(sdlPath, dir, name, graph string, halves migrate.Halves) error {
 	model, err := build(sdlPath, graph)
@@ -264,7 +305,7 @@ func generate(sdlPath, dir, name, graph string, halves migrate.Halves) error {
 	}
 	paths, err := migrate.Generate(dir, model, name, halves)
 	if err != nil {
-		return disownGuidance(err, halves)
+		return disownGuidance(err)
 	}
 	if len(paths) == 0 {
 		fmt.Printf("gopgql: %s is already up to date with %s\n", dir, sdlPath)
@@ -276,40 +317,51 @@ func generate(sdlPath, dir, name, graph string, halves migrate.Halves) error {
 	return nil
 }
 
-// The guidance printed when a turned-off half contradicts the directory's own
+// The guidance printed when the requested halves contradict the directory's own
 // history (design D4a). The refusal itself says what the contradiction is; this
-// says what to do instead, which differs per half — and for --no-graph the
+// says what to do instead, which differs per case — and for --no-graph the
 // legitimate reason to want it is to get rid of the graph, so the message names
 // the deliberate way to do that.
 const (
-	graphDisownGuidance = "Which halves a directory manages is fixed by its first generation.\n" +
-		"To drop the property graph, generate from a desired schema that declares no\n" +
+	graphDisownGuidance = "To drop the property graph, generate from a desired schema that declares no\n" +
 		"graph: that emits the graph-teardown migration and no rebuild, so the drop is\n" +
 		"recorded in the history and reviewable in the diff."
 
-	tablesDisownGuidance = "Which halves a directory manages is fixed by its first generation.\n" +
-		"To hand the tables to another tool from now on, generate the graph half into a\n" +
+	tablesDisownGuidance = "To hand the tables to another tool from now on, generate the graph half into a\n" +
 		"fresh --dir: suppressing table DDL in a directory that creates tables would\n" +
 		"leave the graph half naming columns nothing creates."
+
+	tablesAdoptGuidance = "To start managing the tables here too, generate both halves into a fresh\n" +
+		"--dir. This history creates no tables, so there is no prior column to diff\n" +
+		"against: every column would be emitted as a fresh ADD COLUMN against tables\n" +
+		"that already have them, and it would fail only after the graph teardown had\n" +
+		"committed — leaving the database with no property graph and this directory\n" +
+		"unapplyable. Pass --no-tables to keep generating the graph half alone."
 )
 
-// disownGuidance appends the per-half guidance to the sentinel refusal.
+// disownGuidance appends the guidance for this refusal to it.
 //
 // The refusal is migrate's, because that is where the history is read; the
-// guidance is the CLI's, because it is about flags. Which half was turned off is
-// known here and nowhere else, so the branch belongs here too.
-func disownGuidance(err error, halves migrate.Halves) error {
-	if !errors.Is(err, migrate.ErrHalfDisowned) {
+// guidance is the CLI's, because it is about flags. The branch reads the case
+// off the error rather than off the flags, so it stays correct however the
+// flags are combined — and the adopt case has no flag to read at all.
+func disownGuidance(err error) error {
+	var conflict *migrate.HalfConflictError
+	if !errors.As(err, &conflict) {
 		return err
 	}
+	var guidance string
 	switch {
-	case halves.NoGraph:
-		return fmt.Errorf("%w\n\n%s", err, graphDisownGuidance)
-	case halves.NoTables:
-		return fmt.Errorf("%w\n\n%s", err, tablesDisownGuidance)
+	case conflict.Adopting:
+		// Only the tables half is ever refused in this direction: a graph is
+		// derivable from the SDL alone, so adopting one is legitimate.
+		guidance = tablesAdoptGuidance
+	case conflict.Half == migrate.GraphHalf:
+		guidance = graphDisownGuidance
 	default:
-		return err
+		guidance = tablesDisownGuidance
 	}
+	return fmt.Errorf("%w\n\n%s", err, guidance)
 }
 
 // build parses and validates the SDL and returns the physical schema model.
